@@ -2,16 +2,19 @@
 
 import os
 import asyncio
+import logging
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, AsyncGenerator
 from datetime import datetime
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain.schema import BaseMessage
 from dotenv import load_dotenv
 
 # 환경 설정 로드
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL_CHAT = os.getenv("GEMINI_MODEL_CHAT", "gemini-2.5-flash")
@@ -19,6 +22,43 @@ GEMINI_MODEL_CHAT = os.getenv("GEMINI_MODEL_CHAT", "gemini-2.5-flash")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
 
+# 생성자 함수 — 재사용 가능한 LLM 인스턴스 반환
+def get_llm(disable_streaming: bool = False) -> ChatGoogleGenerativeAI:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=api_key,
+        temperature=0.7,
+        disable_streaming=disable_streaming
+    )
+    return llm
+
+# 스트리밍 생성: messages를 받아 async generator로 chunk들을 yield
+async def stream_generate(messages: List[BaseMessage]) -> AsyncGenerator[str, None]:
+    """
+    메시지 리스트(SystemMessage, HumanMessage 등)를 받아
+    LLM의 astream()을 통해 부분 결과 문자열을 순차적으로 yield 합니다.
+    """
+    llm = get_llm(disable_streaming=False)
+    generated = ""
+    async for chunk in llm.astream(messages):
+        # chunk 객체 형식은 라이브러리 버전에 따라 다름 — 안전하게 접근
+        content = getattr(chunk, "content", None) or getattr(chunk, "text", None)
+        if content:
+            generated += content
+            yield content
+    # 완료 시 아무 것도 반환하지 않음; 호출자는 완성된 텍스트 길이 등 처리 가능
+
+# 비스트리밍 생성: 한 번에 응답 객체 반환 (비동기)
+async def generate(messages: List[BaseMessage]) -> dict:
+    llm = get_llm(disable_streaming=True)
+    resp = await llm.ainvoke(messages)
+    content = getattr(resp, "content", "") or getattr(resp, "text", "")
+    return {
+        "content": content,
+        "length": len(content),
+        "generated_at": datetime.now().isoformat()
+    }
 class GeminiChatService:
     """LangChain을 사용한 Gemini 챗봇 서비스"""
     
@@ -89,6 +129,8 @@ class GeminiChatService:
 5. 필요시 전문기관 연계 안내
 
 항상 초등학생의 발달 특성과 개별 차이를 고려하여 답변해주세요.
+
+## 필수사항: response_length가 1000 이내로 답변을 요약해서 출력할것!
 """
     
     def _create_context_from_search_results(self, search_results: List[Dict[str, Any]]) -> str:

@@ -7,7 +7,7 @@ import uvicorn
 import os
 from contextlib import asynccontextmanager
 
-from routers import milvus, gemini
+from routers import milvus, gemini, exam_generator
 from services.gemini_service import gemini_service
 
 # 애플리케이션 생명주기 관리
@@ -79,6 +79,7 @@ app.add_middleware(
 # 라우터 등록
 app.include_router(milvus.router, prefix="/api/milvus", tags=["Milvus 벡터 DB"])
 app.include_router(gemini.router, prefix="/api/gemini", tags=["Gemini AI 채팅"])
+app.include_router(exam_generator.router, prefix="/api/exam", tags=["시험 AI 초안 생성기"])
 
 # 루트 엔드포인트
 @app.get("/")
