@@ -9,11 +9,16 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from functools import lru_cache
 import json
+import asyncio
+import logging
+from pymilvus import utility
 
 from services.gemini_service import gemini_service
 from routers.milvus import SearchRecordsRequest, get_milvus_collection
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 # =========================
 # Pydantic 모델 정의
@@ -79,52 +84,116 @@ class ChatResponse(BaseModel):
 # =========================
 
 async def perform_rag_search(query: str, top_k: int = 3, worry_tag: Optional[str] = None) -> List[Dict[str, Any]]:
-    """RAG 검색 수행"""
+    """RAG 검색 수행 - 개선된/안전한 버전"""
     try:
         collection = get_milvus_collection()
-        
-        # 임베딩 생성 (milvus.py의 함수 재사용)
-        from routers.milvus import get_gemini_query_embedding
-        emb = await get_gemini_query_embedding(query)
-        
+
+        # --- 컬렉션 로드 상태 안전 확인 (is_loaded 대체) ---
+        is_loaded = False
+        try:
+            load_state = utility.load_state(collection.name)
+            if hasattr(load_state, "name"):
+                is_loaded = load_state.name.lower() == "loaded"
+            else:
+                is_loaded = "loaded" in str(load_state).lower()
+        except Exception:
+            # load_state 조회 실패하면 시도해서 로드해본다.
+            is_loaded = False
+
+        if not is_loaded:
+            # 메모리로 로드 (블로킹) — 그 뒤에 잠깐 대기해서 실제로 로드되었는지 확인
+            collection.load()
+            # 짧게 기다려 로드 완료 확인
+            for _ in range(10):
+                try:
+                    load_state = utility.load_state(collection.name)
+                    if (hasattr(load_state, "name") and load_state.name.lower() == "loaded") or ("loaded" in str(load_state).lower()):
+                        is_loaded = True
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+
+        # --- 임베딩 생성: sync/coroutine 안전 처리 ---
+        from routers.milvus import embeddings
+        emb_result = embeddings.aembed_query(query)
+        if asyncio.iscoroutine(emb_result):
+            emb = await emb_result
+        else:
+            emb = emb_result
+
+        if emb is None:
+            raise RuntimeError("임베딩 생성 실패: 반환값이 None입니다.")
+        emb = list(emb)  # numpy array인 경우 안전하게 리스트 변환
+
+        # --- 검색 (블로킹) 를 executor로 실행해 이벤트 루프 차단 방지 ---
         search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
-        
         expr = None
         if worry_tag:
             expr = f'worry_tags like "%{worry_tag}%"'
-        
-        results = collection.search(
-            data=[emb],
-            anns_field="embedding",
-            param=search_params,
-            limit=top_k,
-            expr=expr,
-            output_fields=["id", "title", "student_query", "counselor_answer", "date", "teacher_name", "student_name", "worry_tags"],
+
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None,
+            lambda: collection.search(
+                data=[emb],
+                anns_field="embedding",
+                param=search_params,
+                limit=top_k * 2,
+                expr=expr,
+                output_fields=["id", "title", "student_query", "counselor_answer", "date", "teacher_name", "student_name", "worry_tags"],
+            )
         )
-        
+
+        # results 는 list( 검색 배치 수 ) 내에 hits
+        if not results or len(results) == 0:
+            return []
+
+        hits = results[0]
         output = []
-        for hit in results[0]:
-            similarity = round(1 - hit.distance, 4)
-            # 유사도가 너무 낮은 결과는 제외
-            if similarity < 0.3:
+        for i, hit in enumerate(hits):
+            # COSINE metric: hit.distance 가 (1 - cosine_sim) 인 경우가 많으므로 similarity 계산
+            try:
+                similarity = round(1 - hit.distance, 4)
+            except Exception:
+                # 안전 fallback
+                similarity = getattr(hit, "score", None) or 0.0
+
+            # 유사도 임계값 (개발 중에는 낮게, 운영 시 튜닝)
+            if similarity < 0.2:
                 continue
-                
-            output.append({
-                "id": hit.entity.get("id"),
-                "title": hit.entity.get("title"),
-                "student_query": hit.entity.get("student_query"),
-                "counselor_answer": hit.entity.get("counselor_answer"),
-                "date": hit.entity.get("date"),
-                "teacher_name": hit.entity.get("teacher_name"),
-                "student_name": hit.entity.get("student_name"),
-                "worry_tags": hit.entity.get("worry_tags"),
+
+            # hit.entity 가 dict 형식일 것을 기대 (버전 차이 유의)
+            entity = getattr(hit, "entity", {}) or {}
+            # 만약 entity가 비어있으면 raw fields를 사용하도록 시도
+            if not entity:
+                # pymilvus의 Hit 객체에 ._fields 혹은 .entity.get('field') 형태가 다를 수 있음
+                try:
+                    entity = hit.raw or {}
+                except Exception:
+                    entity = {}
+
+            result = {
+                "id": entity.get("id"),
+                "title": entity.get("title"),
+                "student_query": entity.get("student_query"),
+                "counselor_answer": entity.get("counselor_answer"),
+                "date": entity.get("date"),
+                "teacher_name": entity.get("teacher_name"),
+                "student_name": entity.get("student_name"),
+                "worry_tags": entity.get("worry_tags"),
                 "similarity": similarity,
-            })
-        
+            }
+            output.append(result)
+            if len(output) >= top_k:
+                break
+
         return output
-    
+
     except Exception as e:
-        print(f"RAG 검색 실패: {e}")
+        print(f"RAG 검색 실패 - 상세 오류: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 def log_conversation(query: str, response: str, used_rag: bool, search_count: int):
@@ -228,6 +297,7 @@ async def counseling_chat(request: CounselingChatRequest, background_tasks: Back
                 enhanced_query = f"{request.query}\n\n[추가 상황 정보]\n" + "\n".join(context_parts)
         
         # Gemini API 호출
+        print("--------------", enhanced_query, search_results, conversation_history, "======================")
         result = await gemini_service.generate_counseling_response(
             user_query=enhanced_query,
             search_results=search_results,
@@ -405,19 +475,53 @@ async def get_service_status():
         
         gemini_status = "healthy" if test_result["status"] == "success" else "error"
         
-        # Milvus 상태 확인
+        # --- Milvus 상태 체크 안전한 버전 ---
         milvus_status = "healthy"
         milvus_info = {}
         try:
             collection = get_milvus_collection()
+            # total_entities may be available as collection.num_entities
+            total_records = None
+            try:
+                total_records = collection.num_entities
+            except Exception:
+                try:
+                    total_records = collection.num_entities()  # 일부 버전 차이
+                except Exception:
+                    total_records = None
+
+            # load state 확인
+            is_loaded = False
+            try:
+                load_state = utility.load_state(collection.name)
+                if hasattr(load_state, "name"):
+                    is_loaded = load_state.name.lower() == "loaded"
+                else:
+                    is_loaded = "loaded" in str(load_state).lower()
+            except Exception:
+                is_loaded = False
+
+            # index 존재 여부 안전 확인
+            has_index = False
+            try:
+                has_index = collection.has_index()
+            except Exception:
+                # 일부 버전은 collection.indexes 또는 utility API 사용
+                try:
+                    has_index = len(collection.indexes) > 0
+                except Exception:
+                    has_index = False
+
             milvus_info = {
-                "total_records": collection.num_entities,
-                "collection_name": collection.name,
-                "is_loaded": True
+                "total_records": total_records,
+                "collection_name": getattr(collection, "name", None),
+                "is_loaded": is_loaded,
+                "has_index": has_index
             }
         except Exception as e:
             milvus_status = "error"
             milvus_info = {"error": str(e)}
+
         
         overall_status = "healthy" if gemini_status == "healthy" and milvus_status == "healthy" else "degraded"
         
@@ -483,3 +587,69 @@ async def get_usage_statistics():
         },
         "generated_at": datetime.now().isoformat()
     }
+
+@router.get("/debug-rag/")
+async def debug_rag_system(test_query: str = "학습부진 상담"):
+    """RAG 시스템 디버깅용 엔드포인트"""
+    try:
+        collection = get_milvus_collection()
+
+        # 1. 컬렉션 기본 정보 (is_loaded 대체)
+        try:
+            load_state = utility.load_state(collection.name)
+            if hasattr(load_state, "name"):
+                is_loaded = load_state.name.lower() == "loaded"
+            else:
+                is_loaded = "loaded" in str(load_state).lower()
+        except Exception:
+            is_loaded = False
+
+        try:
+            has_index = collection.has_index()
+        except Exception:
+            try:
+                has_index = len(collection.indexes) > 0
+            except Exception:
+                has_index = False
+
+        stats = {
+            "collection_name": getattr(collection, "name", None),
+            "total_entities": getattr(collection, "num_entities", None),
+            "is_loaded": is_loaded,
+            "has_index": has_index
+        }
+
+        # 2. 샘플 데이터 조회 (expr 빈 문자열은 일부 버전에서 오류날 수 있음 -> None으로 처리)
+        try:
+            sample_data = collection.query(
+                expr=None,
+                output_fields=["id", "title", "worry_tags"],
+                limit=3
+            )
+        except TypeError:
+            # 일부 버전은 limit 파라미터를 사용하지 않음
+            sample_data = collection.query(
+                expr=None,
+                output_fields=["id", "title", "worry_tags"]
+            )
+
+        # 3. 테스트 검색
+        test_results = await perform_rag_search(test_query, top_k=3)
+
+        return {
+            "status": "success",
+            "collection_stats": stats,
+            "sample_data": sample_data,
+            "test_search": {
+                "query": test_query,
+                "results_count": len(test_results),
+                "results": test_results
+            }
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }

@@ -1,7 +1,4 @@
-"""
-초등 국어문제 생성 서비스
-"""
-
+# services/quiz_generator_service.py
 from typing import List, Dict, Optional
 import re
 import json

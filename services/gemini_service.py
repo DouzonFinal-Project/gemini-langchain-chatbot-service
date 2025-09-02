@@ -3,12 +3,14 @@
 import os
 import asyncio
 import logging
+from zoneinfo import ZoneInfo
+import itertools
 import json
 from typing import List, Dict, Any, Optional, AsyncGenerator
 from datetime import datetime
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain.schema import BaseMessage
 from dotenv import load_dotenv
 
@@ -176,31 +178,29 @@ class GeminiChatService:
         search_results: Optional[List[Dict[str, Any]]] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
-        """
-        상담 질문에 대한 응답 생성
+        """개선된 상담 응답 생성"""
         
-        Args:
-            user_query: 사용자 질문
-            search_results: Milvus 검색 결과
-            conversation_history: 대화 히스토리 [{"role": "user/assistant", "content": "..."}]
-        
-        Returns:
-            응답 딕셔너리
-        """
         async def _generate_response():
-            # 프롬프트 구성
             system_prompt = self._create_system_prompt()
             
-            # 컨텍스트 생성 (검색 결과 활용)
+            # 컨텍스트 생성 - 더 상세한 로깅
             context = ""
             if search_results:
+                print(f"RAG 컨텍스트 생성 중... 검색 결과 {len(search_results)}개")
                 context = self._create_context_from_search_results(search_results)
+                print(f"생성된 컨텍스트 길이: {len(context)} 문자")
+            else:
+                print("RAG 검색 결과가 없어 기본 모드로 응답 생성")
+                context = "관련 상담 기록이 없습니다. 일반적인 교육학적 지식을 바탕으로 답변하겠습니다."
             
-            # 현재 시간 정보 추가
             current_time = datetime.now().strftime("%Y년 %m월 %d일 %H시 %M분")
             
-            # 전체 프롬프트 구성
+            # 프롬프트에 RAG 사용 여부 명시
+            rag_indicator = "[RAG 활성화]" if search_results else "[기본 모드]"
+            
             full_prompt = f"""{system_prompt}
+
+{rag_indicator}
 
 {context}
 
@@ -209,7 +209,7 @@ class GeminiChatService:
 현재 상담 요청:
 {user_query}
 
-위의 관련 상담 기록을 참고하여, 다음과 같이 구조화된 답변을 제공해주세요:
+위의 {"관련 상담 기록을 참고하여" if search_results else "교육학적 지식을 바탕으로"}, 다음과 같이 구조화된 답변을 제공해주세요:
 
 1. **상황 이해**: 현재 상황에 대한 이해와 공감 표현
 2. **문제 분석**: 가능한 원인과 배경 요인들
@@ -217,44 +217,31 @@ class GeminiChatService:
 4. **추가 고려사항**: 주의할 점이나 장기적 관점에서의 조언
 5. **필요시 연계**: 전문기관이나 추가 지원이 필요한 경우 안내
 
-전문적이면서도 실무에서 바로 적용할 수 있는 조언을 부탁드립니다."""
+전문적이면서도 실무에서 바로 적용할 수 있는 조언을 부탁드립니다.
+(응답 길이: 1000자 이내)"""
 
-            # 대화 히스토리가 있는 경우 chat 세션 사용
+            # 대화 히스토리 처리
             if conversation_history:
-                # Reconstruct the chat history using LangChain message objects
                 langchain_history = []
                 for msg in conversation_history[-10:]:
                     if msg["role"] == "user":
                         langchain_history.append(HumanMessage(content=msg["content"]))
                     elif msg["role"] == "assistant":
                         langchain_history.append(AIMessage(content=msg["content"]))
-
-                # Append the current prompt to the history
+                
                 langchain_history.append(HumanMessage(content=full_prompt))
-
-                # Invoke the model with the complete history
-                # The model will use the history as context for the new prompt
                 response = await self.model.ainvoke(langchain_history)
-
-                # Access the generated text
                 return response.content
             else:
-                response = await self.model.ainvoke(
-                [HumanMessage(content=full_prompt)],
-                config={
-                    "temperature": 0.7,
-                    "top_p": 0.9,
-                    "top_k": 40,
-                    "max_output_tokens": 3000,
-                    "candidate_count": 1,
-                }
-            )
-
-            return response.content
+                response = await self.model.ainvoke([HumanMessage(content=full_prompt)])
+                return response.content
         
         try:
             async with self._chat_semaphore:
                 response_text = await self._retry_api_call(_generate_response)
+                
+                # 응답 품질 평가 추가
+                response_quality = self._assess_response_quality(response_text, search_results)
                 
                 return {
                     "status": "success",
@@ -262,15 +249,28 @@ class GeminiChatService:
                     "timestamp": datetime.now().isoformat(),
                     "used_context": bool(search_results),
                     "context_count": len(search_results) if search_results else 0,
-                    "context_quality": self._assess_context_quality(search_results) if search_results else None
+                    "context_quality": self._assess_context_quality(search_results) if search_results else None,
+                    "response_quality": response_quality
                 }
                 
         except Exception as e:
+            print(f"상담 응답 생성 실패: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return {
                 "status": "error",
                 "error": f"Gemini API 호출 실패: {str(e)}",
                 "timestamp": datetime.now().isoformat()
             }
+
+    def _assess_response_quality(self, response_text: str, search_results: Optional[List]) -> Dict[str, Any]:
+        """응답 품질 평가"""
+        return {
+            "length": len(response_text),
+            "has_structure": "**" in response_text or "##" in response_text,
+            "used_rag_context": bool(search_results),
+            "estimated_sections": response_text.count("**") // 2
+        }
     
     def _assess_context_quality(self, search_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """검색 결과의 품질을 평가"""
