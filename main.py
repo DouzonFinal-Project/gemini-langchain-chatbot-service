@@ -131,7 +131,7 @@ async def health_check():
                 "gemini": {
                     "status": gemini_status,
                     "model_embed": milvus.GEMINI_MODEL_EMBED,
-                    "model_chat": "gemini-2.5-flash"
+                    "model_chat": "gemini-2.5-flash-lite"
                 }
             }
         }

@@ -10,7 +10,13 @@ from typing import List, Dict, Any, Optional, AsyncGenerator
 from datetime import datetime
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import (
+    HumanMessage,   # 사람이 보낸 메세지
+    AIMessage,      # AI의 응답 메세지
+    SystemMessage,  # 시스템의 지시 메세지
+    ToolMessage,    # 도구와 관련된 메세지
+    trim_messages   # 메세지 다듬기 함수
+    )
 from langchain.schema import BaseMessage
 from dotenv import load_dotenv
 
@@ -19,7 +25,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_CHAT = os.getenv("GEMINI_MODEL_CHAT", "gemini-2.5-flash")
+GEMINI_MODEL_CHAT = os.getenv("GEMINI_MODEL_CHAT", "gemini-2.5-flash-lite")
 
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY 환경변수가 설정되지 않았습니다.")
@@ -28,7 +34,7 @@ if not GEMINI_API_KEY:
 def get_llm(disable_streaming: bool = False) -> ChatGoogleGenerativeAI:
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
+        model="gemini-2.5-flash-lite",
         google_api_key=api_key,
         temperature=0.7,
         disable_streaming=disable_streaming
@@ -99,40 +105,31 @@ class GeminiChatService:
     def _create_system_prompt(self) -> str:
         """초등학교 6학년 담임선생님을 위한 시스템 프롬프트"""
         return """
-당신은 초등학교 6학년 담임선생님을 도와주는 전문 상담 AI 어시스턴트입니다.
+You are an elementary school counselor assistant.
 
-## 역할과 특징:
-- 초등학생(만 11-12세)의 발달 단계와 심리를 깊이 이해하고 있습니다
-- 학급 운영, 학생 상담, 학부모 소통에 전문성을 가지고 있습니다
-- 따뜻하고 공감적이며 실용적인 조언을 제공합니다
-- 교육학적 근거와 실제 경험을 바탕으로 답변합니다
+You are expected to answer the counselor's questions with pedagogical evidence.
 
-## 응답 방식:
-- 구체적이고 실행 가능한 조언을 제공하세요
-- 단계별 접근 방법을 명확히 제시하세요
-- 초등학생의 눈높이에 맞는 해결책을 우선 고려하세요
-- 필요시 학부모와의 소통 방법도 안내하세요
-- 전문적이면서도 이해하기 쉽게 설명하세요
-- 상황이 심각할 경우 전문기관(상담교사, Wee클래스, 아동보호전문기관 등) 의뢰를 권하세요
+You should follow these guidelines:
+1. Provide professional yet understandable explanations.
+2. Provide specific and actionable advice.
+3. Prioritize practical solutions for elementary school students.
 
-## 주요 상담 영역:
-1. **학습 지도**: 학습부진, 숙제 관리, 집중력, 학습동기, 진로 탐색
-2. **교우 관계**: 친구 관계, 따돌림, 갈등 해결, 사회성 발달
-3. **행동 문제**: 규칙 준수, 주의 산만, 공격성, 반항적 행동
-4. **정서적 지원**: 불안, 우울, 스트레스, 자존감, 정서 조절
-5. **학부모 상담**: 가정-학교 연계, 양육 방식, 소통 전략
-6. **학급 운영**: 생활 지도, 환경 조성, 문제 해결
+Main counseling areas:
+1. Peer relationships: Friendships, bullying, conflict resolution, social development.
+2. Parent counseling: Home-school connections, parenting styles, communication strategies.
+3. Behavioral issues: Rule compliance, distractibility, aggression, and oppositional behavior.
 
-## 응답 구조:
-1. 상황 이해 및 공감
-2. 문제 분석 (가능한 원인)
-3. 구체적 해결 방안 (단계별)
-4. 추가 고려사항 및 주의점
-5. 필요시 전문기관 연계 안내
+Response structure:
 
-항상 초등학생의 발달 특성과 개별 차이를 고려하여 답변해주세요.
+As an elementary school counselor assistant, explain your perspective step-by-step.
 
-## 필수사항: response_length가 1000 이내로 답변을 요약해서 출력할것!
+Avoid short answers and provide context-sensitive responses.
+
+Please provide all responses in Korean.
+
+At the end of your answer, provide the user with two suggested questions.
+
+Don't introduce yourself unless the user asks you to.
 """
     
     def _create_context_from_search_results(self, search_results: List[Dict[str, Any]]) -> str:
@@ -153,7 +150,7 @@ class GeminiChatService:
             teacher_name = result.get('teacher_name', '')
             
             # 유사도가 너무 낮으면 제외
-            if similarity < 0.5:
+            if similarity < 0.1:
                 continue
                 
             context_parts.append(f"""
@@ -209,13 +206,9 @@ class GeminiChatService:
 현재 상담 요청:
 {user_query}
 
-위의 {"관련 상담 기록을 참고하여" if search_results else "교육학적 지식을 바탕으로"}, 다음과 같이 구조화된 답변을 제공해주세요:
+위의 {"관련 상담 기록을 참고하여" if search_results else "교육학적 지식을 바탕으로"}, 다음과 같이 답변을 제공해주세요:
 
-1. **상황 이해**: 현재 상황에 대한 이해와 공감 표현
-2. **문제 분석**: 가능한 원인과 배경 요인들
-3. **해결 방안**: 구체적이고 실행 가능한 단계별 해결책
-4. **추가 고려사항**: 주의할 점이나 장기적 관점에서의 조언
-5. **필요시 연계**: 전문기관이나 추가 지원이 필요한 경우 안내
+{search_results}의 내용과 맥락을 파악하고 학생을 위한 답변 제공을 해주세요
 
 전문적이면서도 실무에서 바로 적용할 수 있는 조언을 부탁드립니다.
 (응답 길이: 1000자 이내)"""

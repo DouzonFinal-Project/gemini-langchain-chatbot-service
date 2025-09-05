@@ -1,6 +1,8 @@
 # routers/gemini.py
 
 import os
+import re
+
 from typing import List, Optional, Dict, Any, Annotated
 from datetime import datetime
 
@@ -130,9 +132,26 @@ async def perform_rag_search(query: str, top_k: int = 3, worry_tag: Optional[str
         search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
         expr = None
         if worry_tag:
-            expr = f'worry_tags like "%{worry_tag}%"'
+            # worry_tag가 리스트로 올 수도 있으니 처리
+            if isinstance(worry_tag, (list, tuple)):
+                raw_tags = [str(t).strip() for t in worry_tag if str(t).strip()]
+            else:
+                raw = str(worry_tag).strip()
+                # 쉼표, 슬래시, 파이프, 세미콜론, 공백 등으로 분리
+                raw_tags = [t.strip() for t in re.split(r'[,/|;\s]+', raw) if t.strip()]
+
+            # 따옴표 제거 등 간단 sanitize
+            tags = [t.replace('"', '').replace("'", "") for t in raw_tags]
+
+            if tags:
+                clauses = [f'worry_tags like "%{tag}%"' for tag in tags]
+                expr = "(" + " or ".join(clauses) + ")"
+
+        # (그 다음 기존 collection.search 호출은 그대로 사용)
+
 
         loop = asyncio.get_running_loop()
+        print("DEBUG RAG expr:", expr, "================")
         results = await loop.run_in_executor(
             None,
             lambda: collection.search(
@@ -151,44 +170,71 @@ async def perform_rag_search(query: str, top_k: int = 3, worry_tag: Optional[str
 
         hits = results[0]
         output = []
+
+        # 1) 첫 번째 패스: 기존 임계값(>=0.2) 적용
         for i, hit in enumerate(hits):
-            # COSINE metric: hit.distance 가 (1 - cosine_sim) 인 경우가 많으므로 similarity 계산
             try:
                 similarity = round(1 - hit.distance, 4)
             except Exception:
-                # 안전 fallback
                 similarity = getattr(hit, "score", None) or 0.0
 
-            # 유사도 임계값 (개발 중에는 낮게, 운영 시 튜닝)
-            if similarity < 0.2:
-                continue
+            if similarity >= 0.2:
+                entity = getattr(hit, "entity", {}) or {}
+                if not entity:
+                    try:
+                        entity = hit.raw or {}
+                    except Exception:
+                        entity = {}
 
-            # hit.entity 가 dict 형식일 것을 기대 (버전 차이 유의)
-            entity = getattr(hit, "entity", {}) or {}
-            # 만약 entity가 비어있으면 raw fields를 사용하도록 시도
-            if not entity:
-                # pymilvus의 Hit 객체에 ._fields 혹은 .entity.get('field') 형태가 다를 수 있음
+                result = {
+                    "id": entity.get("id"),
+                    "title": entity.get("title"),
+                    "student_query": entity.get("student_query"),
+                    "counselor_answer": entity.get("counselor_answer"),
+                    "date": entity.get("date"),
+                    "teacher_name": entity.get("teacher_name"),
+                    "student_name": entity.get("student_name"),
+                    "worry_tags": entity.get("worry_tags"),
+                    "similarity": similarity,
+                }
+                output.append(result)
+                if len(output) >= top_k:
+                    break
+
+        # 2) 폴백: 임계값으로 걸러진 결과가 하나도 없으면 (예: "안녕안녕" 같이 의미적 유사도가 낮을 때)
+        #    동일한 hits에서 임계값을 무시하고 top_k 개를 사용하도록 함.
+        if not output and hits:
+            print("DEBUG: No high-sim hits — falling back to top-k hits (ignoring similarity threshold).")
+            for i, hit in enumerate(hits):
                 try:
-                    entity = hit.raw or {}
+                    similarity = round(1 - hit.distance, 4)
                 except Exception:
-                    entity = {}
+                    similarity = getattr(hit, "score", None) or 0.0
 
-            result = {
-                "id": entity.get("id"),
-                "title": entity.get("title"),
-                "student_query": entity.get("student_query"),
-                "counselor_answer": entity.get("counselor_answer"),
-                "date": entity.get("date"),
-                "teacher_name": entity.get("teacher_name"),
-                "student_name": entity.get("student_name"),
-                "worry_tags": entity.get("worry_tags"),
-                "similarity": similarity,
-            }
-            output.append(result)
-            if len(output) >= top_k:
-                break
+                entity = getattr(hit, "entity", {}) or {}
+                if not entity:
+                    try:
+                        entity = hit.raw or {}
+                    except Exception:
+                        entity = {}
+
+                result = {
+                    "id": entity.get("id"),
+                    "title": entity.get("title"),
+                    "student_query": entity.get("student_query"),
+                    "counselor_answer": entity.get("counselor_answer"),
+                    "date": entity.get("date"),
+                    "teacher_name": entity.get("teacher_name"),
+                    "student_name": entity.get("student_name"),
+                    "worry_tags": entity.get("worry_tags"),
+                    "similarity": similarity,
+                }
+                output.append(result)
+                if len(output) >= top_k:
+                    break
 
         return output
+
 
     except Exception as e:
         print(f"RAG 검색 실패 - 상세 오류: {e}")
@@ -531,7 +577,7 @@ async def get_service_status():
             "services": {
                 "gemini_api": {
                     "status": gemini_status,
-                    "model": "gemini-2.5-flash",
+                    "model": "gemini-2.5-flash-lite",
                     "features": ["chat", "summarization", "keyword_extraction", "planning"]
                 },
                 "milvus_db": {
