@@ -129,7 +129,7 @@ Please provide all responses in Korean.
 
 At the end of your answer, provide the user with two suggested questions.
 
-Don't introduce yourself unless the user asks you to.
+Don't introduce yourself or say hello unless the user asks you to.
 """
     
     def _create_context_from_search_results(self, search_results: List[Dict[str, Any]]) -> str:
