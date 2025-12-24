@@ -3,11 +3,12 @@
 import os
 import re
 
-from typing import List, Optional, Dict, Any, Annotated
+from typing import List, Optional, Dict, Any, Annotated, Union
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.responses import StreamingResponse
+from fastapi import BackgroundTasks
 from pydantic import BaseModel, Field
 from functools import lru_cache
 import json
@@ -80,6 +81,22 @@ class ChatResponse(BaseModel):
     search_results: Optional[List[Dict[str, Any]]] = None
     context_quality: Optional[Dict[str, Any]] = None
     response_time: Optional[float] = None
+
+class MasterChatRequest(BaseModel):
+    # 단일 액션만 허용. 없으면 자동판단 -> counseling_chat
+    action: Optional[str] = Field(default=None, description="요청 액션 (optional). 허용값: counseling_chat, quick_chat, counseling_plan, summarize, extract_keywords")
+    query: Optional[str] = Field(default=None, description="사용자 쿼리 / 질문 (대부분 필수)")
+    use_rag: bool = Field(default=True, description="RAG 사용 여부 (counseling_chat일 때 주로 사용)")
+    search_top_k: int = Field(default=3, ge=1, le=10, description="RAG 검색 상위 k")
+    worry_tag_filter: Optional[str] = Field(default=None, description="RAG 검색시 고민 태그 필터")
+    conversation_history: Optional[list] = Field(default=None, description="대화 히스토리 (ChatMessage list)")
+    student_name: Optional[str] = Field(default=None, description="학생 이름 (선택)")
+    context_info: Optional[Dict[str, str]] = Field(default=None, description="추가 상황 정보 (선택)")
+    urgency_level: Optional[str] = Field(default="normal", description="quick_chat 전용: low|normal|high|urgent")
+    extract_text: Optional[str] = Field(default=None, description="extract_keywords 전용: 추출 대상 텍스트")
+    plan_payload: Optional[Dict[str, Any]] = Field(default=None, description="counseling_plan 전용: 학생정보 등")
+    stream: bool = Field(default=False, description="스트리밍 모드 (현재 미지원; 추후 활성화 예정)")
+
 
 # =========================
 # 헬퍼 함수
@@ -298,6 +315,198 @@ async def get_counseling_guidelines():
 # =========================
 # API 엔드포인트
 # =========================
+
+@router.post("/master-chat/", response_model=ChatResponse)
+async def master_chat(request: MasterChatRequest, background_tasks: BackgroundTasks):
+    """
+    Master router (single-action mode).
+    - action이 지정되지 않으면 query 텍스트 기반 자동판단 후 처리.
+    - 반환: 기존 ChatResponse 형태 (response: str) — 응답은 순수 텍스트.
+    """
+    start_time = datetime.now()
+
+    # 허용 액션 목록
+    allowed = {"counseling_chat", "quick_chat", "counseling_plan", "summarize", "extract_keywords"}
+
+    # 1) action 결정: 우선 request.action(있으면 검증), 없으면 키워드 자동판단
+    action = (request.action or "").strip() or None
+    if action and action not in allowed:
+        raise HTTPException(status_code=400, detail=f"unsupported action: {action}")
+
+    # 자동판단 로직 (action 미지정)
+    if not action:
+        q = (request.query or "").lower()
+        if any(k in q for k in ["계획", "계획 수립", "상담 계획", "plan 작성", "plan"]):
+            action = "counseling_plan"
+        elif any(k in q for k in ["요약", "정리", "요약해", "summarize", "summary"]):
+            action = "summarize"
+        elif any(k in q for k in ["키워드", "태그", "핵심어", "추출"]):
+            action = "extract_keywords"
+        elif any(k in q for k in ["긴급", "급함", "빨리", "빠른"]):
+            action = "quick_chat"
+        else:
+            action = "counseling_chat"  # 기본
+
+    # Enforce single-action (user requested single-action behavior)
+    # (If they accidentally sent multiple elsewhere, we ignore extras.)
+    # Validate required fields for chosen action
+    if action in {"counseling_chat", "quick_chat"} and not request.query:
+        raise HTTPException(status_code=400, detail="query is required for chat actions")
+    if action == "summarize" and not request.conversation_history:
+        raise HTTPException(status_code=400, detail="conversation_history is required for summarize")
+    if action == "extract_keywords" and not (request.extract_text or request.query or request.conversation_history):
+        raise HTTPException(status_code=400, detail="Need text (extract_text or query or conversation_history) to extract keywords")
+    if action == "counseling_plan" and not request.plan_payload and not request.query:
+        # allow plan_payload or query (if user provided student info in query)
+        raise HTTPException(status_code=400, detail="plan_payload (or a query with student info) is required for counseling_plan")
+
+    # 2) RAG (필요한 경우): counseling_chat에서 사용되는 기존 perform_rag_search 재사용
+    search_results = []
+    used_rag = False
+    if request.use_rag and action == "counseling_chat" and request.query:
+        try:
+            search_query = request.query
+            if request.student_name:
+                search_query = f"{request.student_name} 학생 {request.query}"
+            search_results = await perform_rag_search(
+                query=search_query,
+                top_k=request.search_top_k,
+                worry_tag=request.worry_tag_filter
+            )
+            used_rag = bool(search_results)
+        except Exception as e:
+            # RAG 실패는 치명적이지 않게 처리 (로그는 남기고 진행)
+            logging.exception("master-chat: RAG search failed")
+            search_results = []
+            used_rag = False
+
+    # 3) 대화 히스토리/컨텍스트 준비 (기존과 동일하게 최근 일부만 사용)
+    conversation_history = None
+    if request.conversation_history:
+        conversation_history = [
+            {"role": msg.role, "content": msg.content}
+            for msg in request.conversation_history[-20:]
+        ]
+
+    # 4) 추가 컨텍스트 포함한 쿼리 (기존 counseling_chat의 enhanced_query 방식 재사용)
+    enhanced_query = request.query or ""
+    if request.context_info:
+        parts = [f"{k}: {v}" for k, v in request.context_info.items()]
+        if parts:
+            enhanced_query = f"{enhanced_query}\n\n[추가 상황 정보]\n" + "\n".join(parts)
+
+    # 5) 스트리밍 처리(현재 미지원) — 사용자가 나중에 켜면 gemini_service.stream_generate 계열로 구현 가능
+    if request.stream:
+        # 아직 서비스 레이어에 완전한 스트리밍 래퍼가 없다면 501을 반환합니다.
+        # 구현 방법 (참고): gemini_service 내부에 stream_generate_counseling_response(...)를 만들고
+        # 그 함수가 async generator를 반환하도록 한 뒤 StreamingResponse로 감싸면 됩니다.
+        raise HTTPException(status_code=501, detail="streaming mode is not implemented yet. Will add a streaming generator in gemini_service and then enable this flag.")
+
+    # 6) 액션별 실행 (단일 액션)
+    try:
+        if action == "counseling_chat":
+            result = await gemini_service.generate_counseling_response(
+                user_query=enhanced_query,
+                search_results=search_results if used_rag else None,
+                conversation_history=conversation_history
+            )
+            if result.get("status") == "success":
+                # 비동기 로깅(기존 방식 재사용)
+                background_tasks.add_task(log_conversation, request.query or "", result["response"], used_rag, len(search_results))
+                response_time = (datetime.now() - start_time).total_seconds()
+                return ChatResponse(
+                    status="success",
+                    response=result["response"],
+                    timestamp=result.get("timestamp", datetime.now().isoformat()),
+                    used_rag=used_rag,
+                    search_results_count=len(search_results) if used_rag else 0,
+                    response_time=response_time
+                )
+            else:
+                raise HTTPException(status_code=500, detail=result.get("error", "counseling generation failed"))
+
+        elif action == "quick_chat":
+            q = enhanced_query
+            if request.urgency_level == "urgent":
+                q = f"[긴급 상담] {q}\n\n즉시 실행 가능한 구체적 해결책을 우선 제시해주세요."
+            elif request.urgency_level == "high":
+                q = f"[우선 처리] {q}\n\n빠른 해결이 필요합니다."
+
+            result = await gemini_service.generate_counseling_response(
+                user_query=q, search_results=None, conversation_history=conversation_history
+            )
+            if result.get("status") == "success":
+                response_time = (datetime.now() - start_time).total_seconds()
+                return ChatResponse(
+                    status="success",
+                    response=result["response"],
+                    timestamp=result.get("timestamp", datetime.now().isoformat()),
+                    used_rag=False,
+                    search_results_count=0,
+                    response_time=response_time
+                )
+            else:
+                raise HTTPException(status_code=500, detail=result.get("error", "quick chat failed"))
+
+        elif action == "summarize":
+            # generate_summary expects conversation_history list
+            result = await gemini_service.generate_summary(conversation_history)
+            if isinstance(result, dict) and result.get("status") == "success":
+                response_time = (datetime.now() - start_time).total_seconds()
+                return ChatResponse(
+                    status="success",
+                    response=result.get("summary"),
+                    timestamp=result.get("timestamp", datetime.now().isoformat()),
+                    used_rag=False,
+                    search_results_count=0,
+                    response_time=response_time
+                )
+            else:
+                raise HTTPException(status_code=500, detail=result.get("error", "summary generation failed"))
+
+        elif action == "extract_keywords":
+            # 우선 extract_text -> query -> conversation_history 순으로 텍스트 확보
+            text_for_extract = request.extract_text or request.query or ""
+            if not text_for_extract and conversation_history:
+                text_for_extract = "\n".join([f"{m['role']}: {m['content']}" for m in conversation_history])
+            result = await gemini_service.generate_keywords(text_for_extract)
+            if isinstance(result, dict) and result.get("status") == "success":
+                response_time = (datetime.now() - start_time).total_seconds()
+                return ChatResponse(
+                    status="success",
+                    response=result.get("keywords"),
+                    timestamp=result.get("timestamp", datetime.now().isoformat()),
+                    used_rag=False,
+                    search_results_count=0,
+                    response_time=response_time
+                )
+            else:
+                raise HTTPException(status_code=500, detail=result.get("error", "keyword extraction failed"))
+
+        elif action == "counseling_plan":
+            payload = request.plan_payload or {"query": request.query}
+            result = await gemini_service.generate_counseling_plan(payload)
+            if isinstance(result, dict) and result.get("status") == "success":
+                response_time = (datetime.now() - start_time).total_seconds()
+                return ChatResponse(
+                    status="success",
+                    response=result.get("counseling_plan"),
+                    timestamp=result.get("timestamp", datetime.now().isoformat()),
+                    used_rag=False,
+                    search_results_count=0,
+                    response_time=response_time
+                )
+            else:
+                raise HTTPException(status_code=500, detail=result.get("error", "counseling plan generation failed"))
+
+        else:
+            raise HTTPException(status_code=400, detail=f"unsupported action: {action}")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("master-chat failed")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/counseling-chat/", response_model=ChatResponse)
 async def counseling_chat(request: CounselingChatRequest, background_tasks: BackgroundTasks):
